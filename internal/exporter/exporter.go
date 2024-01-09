@@ -5,6 +5,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
@@ -13,9 +16,11 @@ import (
 
 // Exporter implements the prometheus.Exporter interface, and exports PuppetDB metrics
 type Exporter struct {
-	client    *puppetdb.PuppetDB
-	namespace string
-	metrics   map[string]*prometheus.GaugeVec
+	promRegistry  *prometheus.Registry
+	client        *puppetdb.PuppetDB
+	namespace     string
+	metrics       map[string]*prometheus.GaugeVec
+	reportMetrics bool
 }
 
 var (
@@ -25,9 +30,20 @@ var (
 )
 
 // NewPuppetDBExporter returns a new exporter of PuppetDB metrics.
-func NewPuppetDBExporter(url, certPath, caPath, keyPath string, sslSkipVerify bool, categories map[string]struct{}) (e *Exporter, err error) {
+func NewPuppetDBExporter(
+	url,
+	certPath,
+	caPath,
+	keyPath string,
+	sslSkipVerify bool,
+	categories map[string]struct{},
+	reportMetrics bool,
+	promRegistry *prometheus.Registry,
+) (e *Exporter, err error) {
 	e = &Exporter{
-		namespace: "puppetdb",
+		namespace:     "puppetdb",
+		promRegistry:  promRegistry,
+		reportMetrics: reportMetrics,
 	}
 
 	opts := &puppetdb.Options{
@@ -81,7 +97,10 @@ func (e *Exporter) Scrape(interval time.Duration, unreportedNode string, categor
 			log.Errorf("failed to get nodes: %s", err)
 		}
 
-		e.metrics["report"].Reset()
+		if e.reportMetrics {
+			e.metrics["report"].Reset()
+		}
+
 		e.metrics["node_report_status_count"].Reset()
 
 		for _, node := range nodes {
@@ -106,7 +125,10 @@ func (e *Exporter) Scrape(interval time.Duration, unreportedNode string, categor
 				log.Errorf("failed to parse report timestamp: %s", err)
 				continue
 			}
-			e.metrics["report"].With(prometheus.Labels{"environment": node.ReportEnvironment, "host": node.Certname, "deactivated": deactivated}).Set(float64(latestReport.Unix()))
+
+			if e.reportMetrics {
+				e.metrics["report"].With(prometheus.Labels{"environment": node.ReportEnvironment, "host": node.Certname, "deactivated": deactivated}).Set(float64(latestReport.Unix()))
+			}
 
 			if deactivated == "false" {
 				if latestReport.Add(unreportedDuration).Before(time.Now()) {
@@ -118,13 +140,21 @@ func (e *Exporter) Scrape(interval time.Duration, unreportedNode string, categor
 				}
 			}
 
-			if node.LatestReportHash != "" {
+			if e.reportMetrics && node.LatestReportHash != "" {
 				reportMetrics, _ := e.client.ReportMetrics(node.LatestReportHash)
 				for _, reportMetric := range reportMetrics {
 					_, ok := categories[reportMetric.Category]
 					if ok {
 						category := fmt.Sprintf("report_%s", reportMetric.Category)
-						e.metrics[category].With(prometheus.Labels{"name": strings.ReplaceAll(strings.Title(reportMetric.Name), "_", " "), "environment": node.ReportEnvironment, "host": node.Certname}).Set(reportMetric.Value)
+						e.metrics[category].With(prometheus.Labels{
+							"name": strings.ReplaceAll(
+								cases.Title(language.English).String(reportMetric.Name),
+								"_",
+								" ",
+							),
+							"environment": node.ReportEnvironment,
+							"host":        node.Certname,
+						}).Set(reportMetric.Value)
 					}
 				}
 			}
@@ -147,23 +177,24 @@ func (e *Exporter) initGauges(categories map[string]struct{}) {
 		Help:      "Total count of reports status by type",
 	}, []string{"status"})
 
-	for category := range categories {
-		metricName := fmt.Sprintf("report_%s", category)
-		e.metrics[metricName] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: "puppet",
-			Name:      metricName,
-			Help:      fmt.Sprintf("Total count of %s per status", category),
-		}, []string{"name", "environment", "host"})
+	if e.reportMetrics {
+		for category := range categories {
+			metricName := fmt.Sprintf("report_%s", category)
+			e.metrics[metricName] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: "puppet",
+				Name:      metricName,
+				Help:      fmt.Sprintf("Total count of %s per status", category),
+			}, []string{"name", "environment", "host"})
+		}
 
+		e.metrics["report"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "puppet",
+			Name:      "report",
+			Help:      "Timestamp of latest report",
+		}, []string{"environment", "host", "deactivated"})
 	}
 
-	e.metrics["report"] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "puppet",
-		Name:      "report",
-		Help:      "Timestamp of latest report",
-	}, []string{"environment", "host", "deactivated"})
-
 	for _, m := range e.metrics {
-		prometheus.MustRegister(m)
+		e.promRegistry.MustRegister(m)
 	}
 }

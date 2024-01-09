@@ -5,10 +5,13 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+
+	"github.com/sirupsen/logrus"
 )
 
 // PuppetDB stores informations used to connect to a PuppetDB
@@ -67,7 +70,7 @@ func NewClient(options *Options) (p *PuppetDB, err error) {
 		}
 
 		// Load CA cert
-		caCert, err := ioutil.ReadFile(options.CACertPath)
+		caCert, err := os.ReadFile(options.CACertPath)
 		if err != nil {
 			err = fmt.Errorf("failed to load ca certificate: %s", err)
 			return nil, err
@@ -81,7 +84,7 @@ func NewClient(options *Options) (p *PuppetDB, err error) {
 			RootCAs:            caCertPool,
 			InsecureSkipVerify: !options.SSLVerify,
 		}
-		tlsConfig.BuildNameToCertificate()
+
 		transport = &http.Transport{TLSClientConfig: tlsConfig}
 	} else {
 		transport = &http.Transport{}
@@ -96,7 +99,38 @@ func NewClient(options *Options) (p *PuppetDB, err error) {
 
 // Nodes returns the list of nodes
 func (p *PuppetDB) Nodes() (nodes []Node, err error) {
-	err = p.get("nodes", "[\"or\", [\"=\", [\"node\", \"active\"], false], [\"=\", [\"node\", \"active\"], true]]", &nodes)
+	err = p.get("nodes", `
+		[
+			"extract",
+			[
+				"certname",
+				"deactivated",
+				"latest_report_hash",
+				"report_environment",
+				"report_timestamp"
+			],
+			[
+				"or",
+				[
+					"=",
+					[
+						"node",
+						"active"
+					],
+					false
+				],
+				[
+					"=",
+					[
+						"node",
+						"active"
+					],
+					true
+				]
+			]
+		]
+	`, &nodes)
+
 	if err != nil {
 		err = fmt.Errorf("failed to get nodes: %s", err)
 		return
@@ -134,11 +168,14 @@ func (p *PuppetDB) get(endpoint string, query string, object interface{}) (err e
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		err = fmt.Errorf("failed to read response: %s", err)
 		return
 	}
+
+	logrus.Debug("response body", string(body))
+
 	err = json.Unmarshal(body, object)
 	if err != nil {
 		err = fmt.Errorf("failed to unmarshal: %s", err)

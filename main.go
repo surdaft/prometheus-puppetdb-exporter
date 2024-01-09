@@ -10,6 +10,7 @@ import (
 	"github.com/jessevdk/go-flags"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/camptocamp/prometheus-puppetdb-exporter/internal/exporter"
@@ -17,18 +18,20 @@ import (
 
 // Config stores handler's configuration
 type Config struct {
-	Version        bool   `long:"version" description:"Show version."`
-	PuppetDBUrl    string `short:"u" long:"puppetdb-url" description:"PuppetDB base URL." env:"PUPPETDB_URL" required:"true" default:"https://puppetdb:8081/pdb/query"`
-	CertFile       string `long:"cert-file" description:"A PEM encoded certificate file." env:"PUPPETDB_CERT_FILE"`
-	KeyFile        string `long:"key-file" description:"A PEM encoded private key file." env:"PUPPETDB_KEY_FILE"`
-	CACertFile     string `long:"ca-file" description:"A PEM encoded CA's certificate." env:"PUPPETDB_CA_FILE"`
-	SSLSkipVerify  bool   `long:"ssl-skip-verify" description:"Skip SSL verification." env:"PUPPETDB_SSL_SKIP_VERIFY"`
-	ScrapeInterval string `long:"scrape-interval" description:"Duration between two scrapes." env:"PUPPETDB_SCRAPE_INTERVAL" default:"5s"`
-	ListenAddress  string `long:"listen-address" description:"Address to listen on for web interface and telemetry." env:"PUPPETDB_LISTEN_ADDRESS" default:"0.0.0.0:9635"`
-	MetricPath     string `long:"metric-path" description:"Path under which to expose metrics." env:"PUPPETDB_METRIC_PATH" default:"/metrics"`
-	Verbose        bool   `long:"verbose" description:"Enable debug mode" env:"PUPPETDB_VERBOSE"`
-	UnreportedNode string `long:"unreported-node" description:"Tag nodes as unreported if the latest report is older than the defined duration." env:"PUPPETDB_UNREPORTED_NODE" default:"2h"`
-	Categories     string `long:"categories" description:"Report metrics categories to scrape." env:"REPORT_METRICS_CATEGORIES" default:"resources,time,changes,events"`
+	Version                   bool   `long:"version" description:"Show version."`
+	PuppetDBUrl               string `short:"u" long:"puppetdb-url" description:"PuppetDB base URL." env:"PUPPETDB_URL" required:"true" default:"https://puppetdb:8081/pdb/query"`
+	CertFile                  string `long:"cert-file" description:"A PEM encoded certificate file." env:"PUPPETDB_CERT_FILE"`
+	KeyFile                   string `long:"key-file" description:"A PEM encoded private key file." env:"PUPPETDB_KEY_FILE"`
+	CACertFile                string `long:"ca-file" description:"A PEM encoded CA's certificate." env:"PUPPETDB_CA_FILE"`
+	SSLSkipVerify             bool   `long:"ssl-skip-verify" description:"Skip SSL verification." env:"PUPPETDB_SSL_SKIP_VERIFY"`
+	ScrapeInterval            string `long:"scrape-interval" description:"Duration between two scrapes." env:"PUPPETDB_SCRAPE_INTERVAL" default:"5s"`
+	ListenAddress             string `long:"listen-address" description:"Address to listen on for web interface and telemetry." env:"PUPPETDB_LISTEN_ADDRESS" default:"0.0.0.0:9635"`
+	MetricPath                string `long:"metric-path" description:"Path under which to expose metrics." env:"PUPPETDB_METRIC_PATH" default:"/metrics"`
+	Verbose                   bool   `long:"verbose" description:"Enable debug mode" env:"PUPPETDB_VERBOSE"`
+	UnreportedNode            string `long:"unreported-node" description:"Tag nodes as unreported if the latest report is older than the defined duration." env:"PUPPETDB_UNREPORTED_NODE" default:"2h"`
+	Categories                string `long:"categories" description:"Report metrics categories to scrape." env:"REPORT_METRICS_CATEGORIES" default:"resources,time,changes,events"`
+	DisableApplicationMetrics bool   `long:"disable-application-metrics" description:"Hide default application metrics in metrics endpoint" env:"DISABLE_APPLICATION_METRICS"`
+	DisableReportMetrics      bool   `long:"disable-report-metrics" description:"Hide report metrics in metrics endpoint" env:"DISABLE_REPORT_METRICS"`
 }
 
 var (
@@ -45,7 +48,7 @@ func main() {
 		if flagsErr, ok := err.(*flags.Error); ok && flagsErr.Type == flags.ErrHelp {
 			os.Exit(0)
 		} else {
-			os.Exit(1)
+			logrus.Panic(flagsErr)
 		}
 	}
 
@@ -76,7 +79,25 @@ func main() {
 	for _, category := range cats {
 		categories[category] = struct{}{}
 	}
-	exp, err := exporter.NewPuppetDBExporter(c.PuppetDBUrl, c.CertFile, c.CACertFile, c.KeyFile, c.SSLSkipVerify, categories)
+
+	var promRegistry *prometheus.Registry
+	if c.DisableApplicationMetrics {
+		promRegistry = prometheus.NewRegistry()
+	} else {
+		promRegistry = prometheus.DefaultRegisterer.(*prometheus.Registry)
+	}
+
+	exp, err := exporter.NewPuppetDBExporter(
+		c.PuppetDBUrl,
+		c.CertFile,
+		c.CACertFile,
+		c.KeyFile,
+		c.SSLSkipVerify,
+		categories,
+		!c.DisableReportMetrics,
+		promRegistry,
+	)
+
 	if err != nil {
 		log.Fatalf("failed to initialize exporter: %s", err)
 	}
@@ -88,19 +109,21 @@ func main() {
 		Help: "puppetdb exporter build informations",
 	}, []string{"version", "commit_sha", "build_date", "golang_version"})
 	buildInfo.WithLabelValues(version, commitSha1, buildDate, runtime.Version()).Set(1)
-	prometheus.MustRegister(buildInfo)
+	promRegistry.MustRegister(buildInfo)
 
-	http.Handle(c.MetricPath, promhttp.Handler())
+	http.Handle(c.MetricPath, promhttp.HandlerFor(promRegistry, promhttp.HandlerOpts{}))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`
-<html>
-<head><title>Prometheus PuppetDB Exporter v` + version + `</title></head>
-<body>
-<h1>Prometheus PuppetDB Exporter ` + version + `</h1>
-<p><a href='` + c.MetricPath + `'>Metrics</a></p>
-</body>
-</html>
-						`))
+			<html>
+			<head>
+				<title>Prometheus PuppetDB Exporter v` + version + `</title>
+			</head>
+			<body>
+				<h1>Prometheus PuppetDB Exporter ` + version + `</h1>
+				<p><a href='` + c.MetricPath + `'>Metrics</a></p>
+			</body>
+			</html>
+		`))
 	})
 
 	log.Infof("Providing metrics at %s%s", c.ListenAddress, c.MetricPath)
